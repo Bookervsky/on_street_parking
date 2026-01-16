@@ -1,6 +1,6 @@
 """
 Pseudo Code for Outer Approximation (OA) Algorithm:
-0. Initialize: LB = -infinity,  UB = +infinity
+0. Initialize: LB = 0,  UB = +infinity
 
 while gap < \epsilon
 1. Initialize a feasible y_k on the upper-level
@@ -12,7 +12,6 @@ while gap < \epsilon
 
 import scipy.optimize as opt
 import scipy.sparse as sp
-import scipy.sparse.csgraph as csgraph
 from scipy.sparse import csr_matrix
 
 import numpy as np
@@ -20,7 +19,6 @@ import pandas as pd
 import itertools
 import pyomo.environ as pyo
 import traceback
-import time
 import logging
 
 from src.DNDP import DNDP
@@ -29,11 +27,9 @@ from pyomo.core import TransformationFactory
 from pyomo.opt import SolverFactory, SolverStatus, TerminationCondition
 from log import setup_log
 
-logger = setup_log(log_dir="../")
-
-class BC(DNDP):
+class OA(DNDP):
     """
-    subclass of DNDP, implement the Branch-and-Cut algorithm for solving the DNDP problem.
+    subclass of DNDP, implement the Outer Approximation algorithm for solving the DNDP problem.
     Inherited methods:
     run_workflow(),
     construct_network(), construct_nodes(), construct_links(), read_OD_data(): construct the network
@@ -46,9 +42,9 @@ class BC(DNDP):
         super().__init__(work_dir, node_file, link_file, OD_file)
 
     def build_model(self):
-        self.minlp = MINLP()
-        self.minlp.model = self.build_base_model()
-        self.minlp.build_milp()
+        self.RMP = RMIL_MP()
+        self.RMP.model = self.build_base_model()
+        self.RMP.build_RMIL_MP()
 
     def solve_model(self):
         LB, UB = 0, float("inf")
@@ -58,53 +54,53 @@ class BC(DNDP):
         k = 1
         while gap > self.dndp_epsilon:
             logging.info(
-                f"############### DNDP Iteration {k} starts, current gap: {gap}, LB: {LB}, UB: {UB} ###############"
+                f"############### Outer Approximation Iteration {k} starts, current gap: {gap}, LB: {LB}, UB: {UB} ###############"
             )
             # 2. Solve the Master MINLP problem, obtain y^k and LB^k, update LB.
-            self.minlp.solve_minlp()
+            self.RMP.solve_RMIL_MP()
 
             ## IF infeasible, terminate, return best solution found so far.
             temp_LB = self.w_1 * pyo.value(
-                sum(self.minlp.model.u_ij[i, j] for i, j in self.minlp.model.A)
+                sum(self.RMP.model.u_ij[i, j] for i, j in self.RMP.model.A)
             ) + self.w_2 * pyo.value(
-                sum(self.minlp.model.z_ij[i, j] for i, j in self.minlp.model.A)
-            ) + self.w_3 * self.minlp.true_obj_cost
+                sum(self.RMP.model.z_ij[i, j] for i, j in self.RMP.model.A)
+            ) + self.w_3 * self.RMP.true_obj_cost
 
             if temp_LB < LB * (1 - self.dndp_epsilon):
-                logging.warning("!!!!MINLP solver returns a worse LB, this indicates an error with ue-reduction cut or no-good cut!!!!")
+                logging.warning("!!!!RMILP_MP solver returns a worse LB, this indicates an error with ue-reduction cut or no-good cut!!!!")
             LB = max(temp_LB, LB)
 
             if LB >= UB * (1 - self.dndp_epsilon):
                 self.LB_record.append(LB)
                 self.UB_record.append(UB)
                 logging.info(
-                    f"############### DNDP Iteration {k} ends, LB={LB} >= UB*(1-epsilon)={UB*(1-self.dndp_epsilon)} ############### \n"
-                    f"~~~~~~~~~~~~~DNDP converged at iteration: {k}, reach goal gap: {self.dndp_epsilon}~~~~~~~~~~~~~"
+                    f"############### Outer Approximation Iteration {k} ends, LB={LB} >= UB*(1-epsilon)={UB*(1-self.dndp_epsilon)} ############### \n"
+                    f"~~~~~~~~~~~~~Outer Approximation converged at iteration: {k}, reach goal gap: {self.dndp_epsilon}~~~~~~~~~~~~~"
                 )
                 break
 
             # 3. Solve the UE subproblem with fixed y^k, obtain x^k and UB^k, update UB
             self.network.link_capacity = np.array(
-                [self.minlp.model.capacity[i, j].value for i, j in self.minlp.model.A]
+                [self.RMP.model.capacity[i, j].value for i, j in self.RMP.model.A]
             )
             self.solve_subproblem(epsilon=1e-4, maxIter=1000)
 
             temp_UB = (
                 self.w_1
                 * pyo.value(
-                    sum(self.minlp.model.u_ij[i, j] for i, j in self.minlp.model.A)
+                    sum(self.RMP.model.u_ij[i, j] for i, j in self.RMP.model.A)
                 )
                 + self.w_2
                 * pyo.value(
-                    sum(self.minlp.model.z_ij[i, j] for i, j in self.minlp.model.A)
+                    sum(self.RMP.model.z_ij[i, j] for i, j in self.RMP.model.A)
                 )
                 + self.w_3 * sum(self.network.link_flow * self.network.link_time_cost)
             )
             if temp_UB < UB:
                 UB = temp_UB
                 self.best_solution = [
-                    pyo.value(self.minlp.model.y_ij[i, j])
-                    for i, j in self.minlp.model.A
+                    pyo.value(self.RMP.model.y_ij[i, j])
+                    for i, j in self.RMP.model.A
                 ]
 
             # 4. Add no good integer cut and UE-reduction cut
@@ -162,6 +158,7 @@ class BC(DNDP):
                 for id, length in zip(self.network.links_id, self.network.link_length)
             },
         )
+        model.l_0 = 100  # length that are not allowed for on-street parking on a road segment near intersections
         model.c_0 = pyo.Param(
             model.A,
             within=pyo.NonNegativeReals,
@@ -231,6 +228,7 @@ class BC(DNDP):
                 )
             },
         )
+        model.w_b = 4.0
         model.w_p = pyo.Param(
             model.A,
             within=pyo.NonNegativeReals,
@@ -294,51 +292,47 @@ class BC(DNDP):
             initialize=init_p_ij_N,
         )
 
-        # 2.3 Parking Adjustment factors
-        ### psi: if a lane has lane separator, psi = 0, else psi = 1
-        model._psi = pyo.Param(
-            model.A,
-            within=pyo.Binary,
-            default=1,
-            initialize={
-                idx: 1 - link.lane_separator for idx, link in self.links.items()
-            },
-        )
+        # 2.3 Parking demand on each link
+        def init_L_ij(model, i, j):
+            return model._lambda_ij[i, j] * (1 - model.p_ij_N[i, j]) / model._mu_ij
 
-        ## delta: if a lane has non-motor vehicle, delta = 0, else delta = 1
+        model.L_ij = pyo.Expression(model.A, rule=init_L_ij)
+
+        # 2.4 Parking Adjustment factors
+        ### delta: if a lane has lane separator, psi = 0, else psi = 1
         model._delta = pyo.Param(
             model.A,
             within=pyo.Binary,
-            default=1,
-            initialize={idx: 1 - link.non_motor for idx, link in self.links.items()},
+            default=0,
+            initialize={
+                idx: link.lane_separator for idx, link in self.links.items()
+            },
+        )
+
+        ## psi: if a lane has non-motor vehicle, delta = 0, else delta = 1
+        model._psi = pyo.Param(
+            model.A,
+            within=pyo.Binary,
+            default=0,
+            initialize={idx: link.non_motor for idx, link in self.links.items()},
         )
 
         ## f_l: lane reduction factor
         def init_f_l(model, i, j):
             return (
                 1
-                - model.w_p[i, j]
-                / 9.144
-                / model.lane_num[i, j]
-                * model._psi[i, j]
-                * model._delta[i, j]
+                + ((1 - model._psi[i, j]) * model.w_b - model.w_p[i, j])
+                / (9.144 * model.lane_num[i, j])
+                * (1 - model._delta[i, j])
             )
 
         model.f_l = pyo.Param(model.A, within=pyo.NonNegativeReals, initialize=init_f_l)
 
         ## f_p: parking reduction factor
         def init_f_p(model, i, j):
-            return 1 - 0.0012 * model.w_p[i, j] * model._lambda_ij[i, j] * (
-                1 - model.p_ij_N[i, j]
-            )
+            return 1 - 0.0012 * 6 * model.L_ij[i,j]  * (1 - model._delta[i,j]) # 6 denotes length of a parking space in meters
 
         model.f_p = pyo.Param(model.A, within=pyo.NonNegativeReals, initialize=init_f_p)
-
-        # 2.4 Parking demand on each link
-        def init_L_ij(model, i, j):
-            return model._lambda_ij[i, j] * (1 - model.p_ij_N[i, j]) / model._mu_ij
-
-        model.L_ij = pyo.Expression(model.A, rule=init_L_ij)
 
         # 2.5 big-M
         def init_big_M(model, i, j):
@@ -396,7 +390,7 @@ class BC(DNDP):
 
         # Fix parking policy == allow, for links with lane_separator
         for i, j in model.A:
-            if model._psi[i, j] == 0:
+            if model._delta[i, j] == 0:
                 model.y_ij[i, j].fix(1)
 
         ## 3.3 u_ij and z_ij for linearizing |L_ij - N_ij * y_ij|
@@ -467,10 +461,11 @@ class BC(DNDP):
         self.network.link_time_cost = self.network.link_fft
 
         TSTT = self.solve_UE_TAP(epsilon, maxIter)
+        logging.info(f"Non-linear Subproblem solved")
         return
 
     def add_no_good_cut(self):
-        model = self.minlp.model
+        model = self.RMP.model
         B_k, N_k = set(), set()
 
         for i, j in model.A:
@@ -487,7 +482,7 @@ class BC(DNDP):
         logging.info(f"Add no-good cut: sum(y in B_k) - sum(y in N_k) <= {len(B_k)-1}")
 
     def add_UE_reduction_cut(self):
-        model = self.minlp.model
+        model = self.RMP.model
         rhs = sum(
             (1 - model.y_ij[i, j])
             * model.fft[i, j]
@@ -513,7 +508,10 @@ class BC(DNDP):
         )
 
 
-class MINLP:
+class RMIL_MP:
+    """
+    Relaxed Master Integer Linear Programming (RMIL_MP) problem for solving the DNDP using Outer Approximation algorithm.
+    """
     def __init__(self):
         self.model = None
         self.epsilon = 5e-3
@@ -529,29 +527,29 @@ class MINLP:
             "FeasibilityTol": 1e-6,
         }
 
-    def solve_minlp(self):
+    def solve_RMIL_MP(self):
         self.obj_gap = float("inf")
         self.ue_gap = float("inf")
         i = 1
         while self.obj_gap >= self.epsilon or self.ue_gap >= self.epsilon:
-            logging.info(f"--------------MINLP iteration {i} starts--------------")
+            logging.info(f"--------------Relaxed Mixed Integer Linear Programming Master Problem iteration {i} starts--------------")
             # 2. solve the MILP, w.r.t  y_ij, x_ij_0, x_ij_1
             self.add_milp_cut()
             self.solve_milp()
             self.update_gap()
             logging.info(
-                f"MINLP Iteration {i} ends, objective linearization gap = {self.obj_gap}, UE-reduction constraint linearization gap= {self.ue_gap}"
+                f"Relaxed Mixed Integer Linear Programming Master Problem Iteration {i} ends, objective linearization gap = {self.obj_gap}, UE-reduction constraint linearization gap= {self.ue_gap}"
             )
             if i == 1:
                 self.get_threshold_flow()
             i += 1
         logging.info(
-            f"********MINLP solved in {i - 1} iterations, final objective linearization gap= {self.obj_gap}, "
+            f"********Relaxed Mixed Integer Linear Programming Master Problem solved in {i - 1} iterations, final objective linearization gap= {self.obj_gap}, "
             f"final UE-reduction constraint linearization gap= {self.ue_gap}"
         )
         return
 
-    def build_milp(self):
+    def build_RMIL_MP(self):
         model = self.model
 
         # 0. Initialize x_0_k and x_1_k, the linearization point
