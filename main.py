@@ -3,12 +3,12 @@ import logging
 
 from src.network import Node, Link, Network
 from src.DNDP import DNDP
-from src.BC import BC
+from src.OA import OA
 
 
 if __name__ == "__main__":
     start = time.time()
-    dndp = BC(
+    dndp = OA(
         work_dir="data/LangFang/",
         node_file="LangFang_nodes.csv",
         link_file="LangFang_net.csv",

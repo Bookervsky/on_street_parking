@@ -51,7 +51,7 @@ class BC(DNDP):
         self.minlp.build_milp()
 
     def solve_model(self):
-        LB, UB = -float("inf"), float("inf")
+        LB, UB = 0, float("inf")
         gap = float("inf")
 
         # 1. Initialize a feasible y_iter on the upper-level
@@ -87,7 +87,7 @@ class BC(DNDP):
             self.network.link_capacity = np.array(
                 [self.minlp.model.capacity[i, j].value for i, j in self.minlp.model.A]
             )
-            self.solve_UE_TAP(epsilon=1e-4, maxIter=1000)
+            self.solve_subproblem(epsilon=1e-4, maxIter=1000)
 
             temp_UB = (
                 self.w_1
@@ -335,10 +335,10 @@ class BC(DNDP):
         model.f_p = pyo.Param(model.A, within=pyo.NonNegativeReals, initialize=init_f_p)
 
         # 2.4 Parking demand on each link
-        def init_o_ij(model, i, j):
+        def init_L_ij(model, i, j):
             return model._lambda_ij[i, j] * (1 - model.p_ij_N[i, j]) / model._mu_ij
 
-        model.o_ij = pyo.Expression(model.A, rule=init_o_ij)
+        model.L_ij = pyo.Expression(model.A, rule=init_L_ij)
 
         # 2.5 big-M
         def init_big_M(model, i, j):
@@ -399,7 +399,7 @@ class BC(DNDP):
             if model._psi[i, j] == 0:
                 model.y_ij[i, j].fix(1)
 
-        ## 3.3 u_ij and z_ij for linearizing |o_ij - N_ij * y_ij|
+        ## 3.3 u_ij and z_ij for linearizing |L_ij - N_ij * y_ij|
         model.u_ij = pyo.Var(model.A, domain=pyo.NonNegativeReals)
         model.z_ij = pyo.Var(model.A, domain=pyo.NonNegativeReals)
 
@@ -411,7 +411,7 @@ class BC(DNDP):
         def unsatisfied_parking_demand_rule(model, i, j):
             return (
                 model.u_ij[i, j]
-                >= model.o_ij[i, j] - model.N_ij[i, j] * model.y_ij[i, j]
+                >= model.L_ij[i, j] - model.N_ij[i, j] * model.y_ij[i, j]
             )
 
         model.u_ij_constr = pyo.Constraint(
@@ -421,7 +421,7 @@ class BC(DNDP):
         def unused_parking_lots_rule(model, i, j):
             return (
                 model.z_ij[i, j]
-                >= model.N_ij[i, j] * model.y_ij[i, j] - model.o_ij[i, j]
+                >= model.N_ij[i, j] * model.y_ij[i, j] - model.L_ij[i, j]
             )
 
         model.z_ij_constr = pyo.Constraint(model.A, rule=unused_parking_lots_rule)
@@ -451,7 +451,7 @@ class BC(DNDP):
 
         return model
 
-    def solve_UE_TAP(self, epsilon, maxIter):
+    def solve_subproblem(self, epsilon, maxIter):
         """
         Subproblem
         Solve the UE-TAP using Frank-Wolfe algorithm.
@@ -466,7 +466,7 @@ class BC(DNDP):
         # reset link flow to zero before each UE-TAP
         self.network.link_time_cost = self.network.link_fft
 
-        TSTT = self.ue_ta(epsilon, maxIter)
+        TSTT = self.solve_UE_TAP(epsilon, maxIter)
         return
 
     def add_no_good_cut(self):
@@ -511,160 +511,6 @@ class BC(DNDP):
         logging.info(
             f"Add UE-reduction cut: sum(kappa_ij) <= sum of current UE-TAP objective value"
         )
-
-    def ue_ta(self, epsilon, maxIter):
-        """
-        Solve the relaxed NLP subproblem, namely the User Equilibrium Traffic Assignment Problem (UE-TAP).
-        return the subproblem variable x_ij(link flow)
-        use x_ij to calculate system optimal objective value, as an over-estimator upper bound of the original NLP subproblem.
-        """
-
-        def determine_search_direction():
-            """
-            # Step 2: Determine search direction
-
-            2.1 Gradient at current solution x_k is simply the BPR function evaluated at x_k,
-            namely: ∇f(x_k) = t_a(x_k).
-            2.2 The LP to solve is min <s_k, ∇f(x_k)>, s.t. s_k ∈ feasible region.
-            The solution of LP min <s_k, ∇f(x_k)> is actually the All or Nothing assignment result,
-            because its physical meaning is to find the route that minimizes the total travel cost
-            given the fixed link cost.
-            """
-
-            def Dijkstra():
-                """
-                Use SciPy's Dijkstra algorithm to find shortest paths from an origin.
-                """
-                num_nodes = len(self.nodes)
-                adj_matrix = np.full((num_nodes, num_nodes), np.inf)
-                # todo: change link.time_cost after each iteration
-                for idx, (tail, head) in enumerate(self.network.links_id):
-                    adj_matrix[tail - 1, head - 1] = self.network.link_time_cost[idx]
-
-                # Run Dijkstra for a single source
-                dists, preds = csgraph.dijkstra(
-                    csgraph=adj_matrix, directed=True, return_predecessors=True
-                )
-
-                return dists, preds
-
-            def Find_Preds(pred, Dest):
-                """
-                Trace the predecessors of a node to find the shortest path.
-                """
-                # pred[Dest-1] is the predecessor of Dest, namely: Dest is the head node of link, pred[Dest-1] is the tail node of link. Dest-1 because of 0-based indexing.
-                while pred[Dest] != -9999:
-                    yield (pred[Dest], Dest)
-                    Dest = pred[Dest]
-
-            """
-            Start of shortest path algorithm
-            """
-            Auxiliary_Flow = {link: 0.0 for link in self.network.links_id}
-            SPTT = 0.0
-            nodes_id = range(len(self.nodes))
-            labels, preds = Dijkstra()
-            preds = preds.tolist()
-            for Origin in nodes_id:
-                pred = preds[Origin]
-                for Dest in nodes_id:
-                    demand = self.OD[Origin][Dest]  # adjust for 0-based indexing
-                    if Origin == Dest or demand == 0 or labels[Origin, Dest] == np.inf:
-                        continue
-                    for tail, head in Find_Preds(pred, Dest):
-                        Auxiliary_Flow[tail + 1, head + 1] += demand
-                    SPTT += labels[Origin, Dest] * demand
-            s_k = Auxiliary_Flow
-            return SPTT, s_k
-
-        def determine_step_size(s_k):
-            """
-            Step 3: Determine step size
-            To determine step_size that
-            Min: f(x_k + step_size * (s_k - x_k)) w.r.t step_size
-            ∇f(step_size) = <∇f(x_k + step_size * (s_k - x_k)), (s_k - x_k)> = 0
-            in which x_k is the current flow, (s_k - x_k) is search direction.
-            This is a LP w.r.t step_size, easy to solve.
-            """
-            alpha = self.network.link_b[0]
-            beta = self.network.link_power[0]
-            s_k = np.array(list(s_k.values()))
-
-            def step_size(step_size):
-                BPR = self.network.link_fft * (
-                    1
-                    + alpha
-                    * (
-                        (
-                            self.network.link_flow
-                            + step_size * (s_k - self.network.link_flow)
-                        )
-                        / self.network.link_capacity
-                    )
-                    ** beta
-                )
-                sum_derivative = np.sum(BPR * (s_k - self.network.link_flow))
-                return sum_derivative
-
-            sol = opt.fsolve(step_size, 0.01)[0]
-            step_size = np.clip(sol, 0.0, 1.0)
-            return step_size
-
-        """
-        Start of the Frank-Wolfe algorithm
-        """
-        # 1. Initialize solution
-        iter = 0
-        gap = float("inf")
-        alpha = self.network.link_b
-        beta = self.network.link_power
-
-        while gap >= epsilon:
-            if self.network.link_flow is None:
-                self.network.link_flow = np.zeros(len(self.links))
-            else:
-                pass
-
-            # 2. Calculate CURRENT TSTT (before finding new direction)
-            TSTT = np.sum(
-                self.network.link_flow * self.network.link_time_cost
-            )  # Total System Travel Time
-
-            # 3. Determine search direction
-            SPTT, s_k = determine_search_direction()
-
-            # 4. calculate convergence
-            if iter > 0:
-                gap = round(abs(1 - SPTT / TSTT), 5)
-
-            if gap < epsilon:
-                logging.info(
-                    f"UE-TAP converged at iteration: {iter} , current gap: {gap}"
-                )
-                break
-            if iter >= maxIter:
-                logging.info(f"UE-TAP did not converge, current gap:{gap}")
-                break
-
-            # 5. Determine step size
-            step_size = determine_step_size(s_k)
-            # AON for first iteration to obtain an initial feasible solution
-            if iter == 0 and gap > 0.2:
-                step_size = 1
-
-            # 6. New iteration point
-            s_k_value = np.array(list(s_k.values()))
-            self.network.link_flow = self.network.link_flow + step_size * (
-                s_k_value - self.network.link_flow
-            )
-            self.network.link_time_cost = self.network.link_fft * (
-                1
-                + alpha * (self.network.link_flow / self.network.link_capacity) ** beta
-            )
-
-            iter += 1
-
-        return TSTT
 
 
 class MINLP:
