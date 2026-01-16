@@ -1,31 +1,12 @@
-"""
-Pseudo Code for Outer Approximation (OA) Algorithm:
-0. Initialize: LB = 0,  UB = +infinity
-
-while gap < \epsilon
-1. Initialize a feasible y_k on the upper-level
-2. solve the NLP, upper-level is minimize SO+c_j* y_j, lower-level is UE-TAP(non-convex due to KKT constraints). Simplifiy the Non-convex non-linear programming as a simple UE-TAP, obtain x_*. Use x* to calculate upper-level objective, obtain and update upper-bound UB_k.
-3. Add optimality cut and generalized benders decomposition cut, substitute non-linear f(x) and g(x)≤0, respectively. Solve the MILP w.r.t. y, obtain and update LB.
-4. Add Integer cut(to avoid duplicate enumeration of y_k)
-5. If UB - LB < \epsilon, terminate, else return to 1.
-"""
-
-import scipy.optimize as opt
-import scipy.sparse as sp
-from scipy.sparse import csr_matrix
-
+import gurobipy as gp
+from gurobipy import GRB
 import numpy as np
 import pandas as pd
-import itertools
-import pyomo.environ as pyo
-import traceback
 import logging
+import itertools
+import scipy.optimize as opt
 
 from src.DNDP import DNDP
-from contextlib import redirect_stdout, redirect_stderr
-from pyomo.core import TransformationFactory
-from pyomo.opt import SolverFactory, SolverStatus, TerminationCondition
-from log import setup_log
 
 class OA(DNDP):
     """
@@ -38,6 +19,7 @@ class OA(DNDP):
     build_model(): build the base MINLP model
     solve_model(): implement the Branch-and-Cut algorithm
     """
+
     def __init__(self, work_dir="", node_file="", link_file="", OD_file=""):
         super().__init__(work_dir, node_file, link_file, OD_file)
 
@@ -56,51 +38,47 @@ class OA(DNDP):
             logging.info(
                 f"############### Outer Approximation Iteration {k} starts, current gap: {gap}, LB: {LB}, UB: {UB} ###############"
             )
-            # 2. Solve the Master MINLP problem, obtain y^k and LB^k, update LB.
+            # 2. Solve the Mixed Integer Linear master problem, obtain y^k and LB^k, update LB.
             self.RMP.solve_RMIL_MP()
 
             ## IF infeasible, terminate, return best solution found so far.
-            temp_LB = self.w_1 * pyo.value(
-                sum(self.RMP.model.u_ij[i, j] for i, j in self.RMP.model.A)
-            ) + self.w_2 * pyo.value(
-                sum(self.RMP.model.z_ij[i, j] for i, j in self.RMP.model.A)
-            ) + self.w_3 * self.RMP.true_obj_cost
+            temp_LB = self.RMP.model.ObjVal
 
             if temp_LB < LB * (1 - self.dndp_epsilon):
-                logging.warning("!!!!RMILP_MP solver returns a worse LB, this indicates an error with ue-reduction cut or no-good cut!!!!")
+                logging.warning(
+                    "!!!!RMILP_MP solver returns a worse LB, this indicates an error with ue-reduction cut or no-good cut!!!!")
             LB = max(temp_LB, LB)
 
             if LB >= UB * (1 - self.dndp_epsilon):
                 self.LB_record.append(LB)
-                self.UB_record.append(UB)
+                self.UB_record.append(self.UB_record[-1])
                 logging.info(
-                    f"############### Outer Approximation Iteration {k} ends, LB={LB} >= UB*(1-epsilon)={UB*(1-self.dndp_epsilon)} ############### \n"
+                    f"############### Outer Approximation Iteration {k} ends, LB={LB} >= UB*(1-epsilon)={UB * (1 - self.dndp_epsilon)} ############### \n"
                     f"~~~~~~~~~~~~~Outer Approximation converged at iteration: {k}, reach goal gap: {self.dndp_epsilon}~~~~~~~~~~~~~"
                 )
                 break
 
             # 3. Solve the UE subproblem with fixed y^k, obtain x^k and UB^k, update UB
             self.network.link_capacity = np.array(
-                [self.RMP.model.capacity[i, j].value for i, j in self.RMP.model.A]
+                [self.RMP.capacity[i, j] for i, j in self.RMP.A]
             )
-            self.solve_subproblem(epsilon=1e-4, maxIter=1000)
+            ue_cost = self.solve_subproblem(epsilon=1e-4, maxIter=1000)
+
+            current_y = {(i, j): self.RMP.y_ij[i, j].X for i, j in self.RMP.A}
+            self.RMP.update_linearization_point(self.network.link_flow, current_y)
 
             temp_UB = (
-                self.w_1
-                * pyo.value(
-                    sum(self.RMP.model.u_ij[i, j] for i, j in self.RMP.model.A)
-                )
-                + self.w_2
-                * pyo.value(
-                    sum(self.RMP.model.z_ij[i, j] for i, j in self.RMP.model.A)
-                )
-                + self.w_3 * sum(self.network.link_flow * self.network.link_time_cost)
+                    self.w_1
+                    * sum(self.RMP.u_ij[i, j].X for i, j in self.RMP.A)
+                    + self.w_2
+                    * sum(self.RMP.z_ij[i, j].X for i, j in self.RMP.A)
+                    + self.w_3 * ue_cost
             )
             if temp_UB < UB:
                 UB = temp_UB
                 self.best_solution = [
-                    pyo.value(self.RMP.model.y_ij[i, j])
-                    for i, j in self.RMP.model.A
+                    self.RMP.y_ij[i, j].X
+                    for i, j in self.RMP.A
                 ]
 
             # 4. Add no good integer cut and UE-reduction cut
@@ -114,15 +92,16 @@ class OA(DNDP):
             if LB >= UB * (1 - self.dndp_epsilon):
                 self.LB_record.append(LB)
                 logging.info(
-                    f"############### DNDP Iteration {k} ends, LB={LB} >= UB*(1-epsilon)={UB*(1-self.dndp_epsilon)} ############### \n"
-                    f"~~~~~~~~~~~~~DNDP converged at iteration: {k}, reach goal gap: {self.dndp_epsilon}~~~~~~~~~~~~~ \n"
+                    f"############### Outer Approximation Iteration {k} ends, LB={LB} >= UB*(1-epsilon)={UB * (1 - self.dndp_epsilon)} ############### \n"
+                    f"~~~~~~~~~~~~~Outer Approximation converged at iteration: {k}, reach goal gap: {self.dndp_epsilon}~~~~~~~~~~~~~ \n"
                     f"Best solution saved to best_solution.csv, "
                 )
+                self.UB_record.append(self.UB_record[-1])
                 break
 
             gap = round(abs(1 - LB / UB), 5)
             logging.info(
-                f"############### DNDP Iteration {k} ends, current gap: {gap}, LB: {LB}, UB: {UB} ###############"
+                f"############### Outer Approximation Iteration {k} ends, current gap: {gap}, LB: {LB}, UB: {UB} ###############"
             )
 
             k += 1
@@ -135,313 +114,242 @@ class OA(DNDP):
         convergence_record.to_csv("convergence_record.csv", index=False)
 
     def build_base_model(self):
-        model = pyo.ConcreteModel()
+        # Change: Use Gurobi Model
+        model = gp.Model("DNDP_Base")
+        model.Params.LogToConsole = 0
+
+        # Change: Use self.RMP to store data (Simulating Pyomo model.param storage)
+        rmp = self.RMP
 
         # 1. Construct sets
         ## Node set
-        rs = list(itertools.product(list(self.nodes.keys()), repeat=2))
-        model.R = pyo.Set(initialize=self.nodes.keys())
-        model.S = pyo.Set(initialize=self.nodes.keys())
-        model.RS = pyo.Set(initialize=rs)
+        rmp.R = list(self.nodes.keys())
+        rmp.S = list(self.nodes.keys())
+        rs = list(itertools.product(rmp.R, repeat=2))
+        rmp.RS = rs
 
         ## Link set
-        model.A = pyo.Set(initialize=[link for link in self.links.keys()])
+        rmp.A = [link for link in self.links.keys()]
 
         # 2. Construct parameters
+        # Change: Using Python Dicts instead of pyo.Param
 
         # 2.1 Network parameters
-        model.l_ij = pyo.Param(
-            model.A,
-            within=pyo.NonNegativeReals,
-            initialize={
-                id: length
-                for id, length in zip(self.network.links_id, self.network.link_length)
-            },
-        )
-        model.l_0 = 100  # length that are not allowed for on-street parking on a road segment near intersections
-        model.c_0 = pyo.Param(
-            model.A,
-            within=pyo.NonNegativeReals,
-            initialize={
-                id: c_0 for id, c_0 in zip(self.network.links_id, self.network.link_c_0)
-            },
-        )
-        model.capacity = pyo.Param(
-            model.A,
-            within=pyo.NonNegativeReals,
-            initialize={
-                id: capacity
-                for id, capacity in zip(
-                    self.network.links_id, self.network.link_capacity
-                )
-            },
-            mutable=True,
-        )
-        model.fft = pyo.Param(
-            model.A,
-            within=pyo.NonNegativeReals,
-            initialize={
-                id: link_fft
-                for id, link_fft in zip(self.network.links_id, self.network.link_fft)
-            },
-        )
-        model._alpha = 0.15
-        model._beta = 4
-        model.lane_num = pyo.Param(
-            model.A,
-            within=pyo.NonNegativeIntegers,
-            initialize={
-                id: link_lane_num
-                for id, link_lane_num in zip(
-                    self.network.links_id, self.network.link_lane_num
-                )
-            },
-        )
-        model.road_width = pyo.Param(
-            model.A,
-            within=pyo.NonNegativeReals,
-            initialize={
-                id: road_width
-                for id, road_width in zip(
-                    self.network.links_id, self.network.link_road_width
-                )
-            },
-        )
+        rmp.l_ij = {
+            id: length
+            for id, length in zip(self.network.links_id, self.network.link_length)
+        }
 
-        model.lane_separator = pyo.Param(
-            model.A,
-            within=pyo.Binary,
-            initialize={
-                id: lane_separator
-                for id, lane_separator in zip(
-                    self.network.links_id, self.network.link_lane_separator
-                )
-            },
-        )
-        model.non_motor = pyo.Param(
-            model.A,
-            within=pyo.Binary,
-            initialize={
-                id: non_motor
-                for id, non_motor in zip(
-                    self.network.links_id, self.network.link_non_motor
-                )
-            },
-        )
-        model.w_b = 4.0
-        model.w_p = pyo.Param(
-            model.A,
-            within=pyo.NonNegativeReals,
-            initialize={
-                id: non_motor
-                for id, non_motor in zip(
-                    self.network.links_id, self.network.parking_width
-                )
-            },
-        )
-        model.N_ij = pyo.Param(
-            model.A,
-            within=pyo.NonNegativeIntegers,
-            initialize={
-                id: N_ij
-                for id, N_ij in zip(self.network.links_id, self.network.parking_nums)
-            },
-        )
+        rmp.l_0 = 100  # length that are not allowed for on-street parking on a road segment near intersections
+        rmp.c_0 = {
+            id: c_0 for id, c_0 in zip(self.network.links_id, self.network.link_c_0)
+        }
+
+        rmp.capacity = {
+            id: capacity
+            for id, capacity in zip(
+                self.network.links_id, self.network.link_capacity
+            )
+        }
+
+        rmp.fft = {
+            id: link_fft
+            for id, link_fft in zip(self.network.links_id, self.network.link_fft)
+        }
+
+        rmp._alpha = 0.15
+        rmp._beta = 4
+        rmp.lane_num = {
+            id: link_lane_num
+            for id, link_lane_num in zip(
+                self.network.links_id, self.network.link_lane_num
+            )
+        }
+
+        rmp.road_width = {
+            id: road_width
+            for id, road_width in zip(
+                self.network.links_id, self.network.link_road_width
+            )
+        }
+
+        rmp.lane_separator = {
+            id: lane_separator
+            for id, lane_separator in zip(
+                self.network.links_id, self.network.link_lane_separator
+            )
+        }
+
+        rmp.non_motor = {
+            id: non_motor
+            for id, non_motor in zip(
+                self.network.links_id, self.network.link_non_motor
+            )
+        }
+
+        rmp.w_b = 4.0
+        rmp.w_p = {
+            id: non_motor
+            for id, non_motor in zip(
+                self.network.links_id, self.network.parking_width
+            )
+        }
+
+        rmp.N_ij = {
+            id: N_ij
+            for id, N_ij in zip(self.network.links_id, self.network.parking_nums)
+        }
 
         ## OD data
-        model.q_rs = pyo.Param(
-            model.R,
-            model.S,
-            within=pyo.NonNegativeReals,
-            initialize=lambda model, r, s: self.OD[r - 1][s - 1],
-        )
+        rmp.q_rs = {(r, s): self.OD[r - 1][s - 1] for r in rmp.R for s in rmp.S}
 
-        model.p_curb = 0.05
+        rmp.p_curb = 0.05
 
         ## 2.2 Parking queuing model parameters
         ### Arrival rate:     n_sj/lambda, The number of parking demand on link a
-        def init_n_ij(model, i, j):
-            total_length = sum(model.l_ij[link] for link in model.A if link[0] == i)
-            ij_proportion = model.l_ij[i, j] / total_length if total_length > 0 else 0
+        rmp._lambda_ij = {}
+        for i, j in rmp.A:
+            total_length = sum(rmp.l_ij[link] for link in rmp.A if link[0] == i)
+            ij_proportion = rmp.l_ij[i, j] / total_length if total_length > 0 else 0
             n_ij = (
-                model.p_curb
-                * sum(model.q_rs[r, s] for (r, s) in model.RS if s == i)
-                * ij_proportion
+                    rmp.p_curb
+                    * sum(rmp.q_rs[r, s] for (r, s) in rmp.RS if s == i)
+                    * ij_proportion
             )
-            return int(n_ij)
-
-        model._lambda_ij = pyo.Param(
-            model.A, within=pyo.NonNegativeReals, default=0, initialize=init_n_ij
-        )
+            rmp._lambda_ij[i, j] = int(n_ij)
 
         ### Departure rate:  mu, the average parking duration
-        model._mu_ij = 2
+        rmp._mu_ij = 2
 
         ### Parking rejection probability
-        def init_p_ij_N(model, i, j):
-            A = model._lambda_ij[i, j] / model._mu_ij
+        rmp.p_ij_N = {}
+        for i, j in rmp.A:
+            A = rmp._lambda_ij[i, j] / rmp._mu_ij
             inverse_p = 1.0
-            for m in range(1, model.N_ij[i, j] + 1):
+            for m in range(1, rmp.N_ij[i, j] + 1):
                 inverse_p += 1.0 + m / A * inverse_p
-            return 1.0 / inverse_p
-
-        model.p_ij_N = pyo.Param(
-            model.A,
-            within=pyo.NonNegativeReals,
-            default=1,
-            initialize=init_p_ij_N,
-        )
+            rmp.p_ij_N[i, j] = 1.0 / inverse_p
 
         # 2.3 Parking demand on each link
-        def init_L_ij(model, i, j):
-            return model._lambda_ij[i, j] * (1 - model.p_ij_N[i, j]) / model._mu_ij
-
-        model.L_ij = pyo.Expression(model.A, rule=init_L_ij)
+        # Change: Calculated immediately and stored as dict (was Pyomo Expression)
+        rmp.L_ij = {}
+        for i, j in rmp.A:
+            rmp.L_ij[i, j] = rmp._lambda_ij[i, j] * (1 - rmp.p_ij_N[i, j]) / rmp._mu_ij
 
         # 2.4 Parking Adjustment factors
         ### delta: if a lane has lane separator, psi = 0, else psi = 1
-        model._delta = pyo.Param(
-            model.A,
-            within=pyo.Binary,
-            default=0,
-            initialize={
-                idx: link.lane_separator for idx, link in self.links.items()
-            },
-        )
+        rmp._delta = {
+            idx: link.lane_separator for idx, link in self.links.items()
+        }
 
         ## psi: if a lane has non-motor vehicle, delta = 0, else delta = 1
-        model._psi = pyo.Param(
-            model.A,
-            within=pyo.Binary,
-            default=0,
-            initialize={idx: link.non_motor for idx, link in self.links.items()},
-        )
+        rmp._psi = {idx: link.non_motor for idx, link in self.links.items()}
 
         ## f_l: lane reduction factor
-        def init_f_l(model, i, j):
-            return (
-                1
-                + ((1 - model._psi[i, j]) * model.w_b - model.w_p[i, j])
-                / (9.144 * model.lane_num[i, j])
-                * (1 - model._delta[i, j])
+        rmp.f_l = {}
+        for i, j in rmp.A:
+            rmp.f_l[i, j] = (
+                    1
+                    + ((1 - rmp._psi[i, j]) * rmp.w_b - rmp.w_p[i, j])
+                    / (9.144 * rmp.lane_num[i, j])
+                    * (1 - rmp._delta[i, j])
             )
 
-        model.f_l = pyo.Param(model.A, within=pyo.NonNegativeReals, initialize=init_f_l)
-
         ## f_p: parking reduction factor
-        def init_f_p(model, i, j):
-            return 1 - 0.0012 * 6 * model.L_ij[i,j]  * (1 - model._delta[i,j]) # 6 denotes length of a parking space in meters
-
-        model.f_p = pyo.Param(model.A, within=pyo.NonNegativeReals, initialize=init_f_p)
+        rmp.f_p = {}
+        for i, j in rmp.A:
+            rmp.f_p[i, j] = 1 - 0.0012 * 6 * rmp.L_ij[i, j] * (
+                        1 - rmp._delta[i, j])  # 6 denotes length of a parking space in meters
 
         # 2.5 big-M
-        def init_big_M(model, i, j):
-            # return sum(model.q_rs[r, s] for (r, s) in model.RS)
-            return 2 * model.c_0[i, j]
-
-        model.big_M = pyo.Param(
-            model.A, within=pyo.NonNegativeReals, initialize=init_big_M
-        )
+        rmp.big_M = {}
+        for i, j in rmp.A:
+            rmp.big_M[i, j] = 2 * rmp.c_0[i, j]
 
         # 2.6 b_k_r, the node flow conservation parameter
-        def init_b_k_r(model, r, k):
-            if k == r:
-                return sum(model.q_rs[r, s] for s in model.S if s != r)
-            else:
-                return -model.q_rs[r, k]
-
-        model.b_k_r = pyo.Param(
-            model.R, model.S, within=pyo.Reals, initialize=init_b_k_r
-        )
+        rmp.b_k_r = {}
+        for r in rmp.R:
+            for k in rmp.S:
+                if k == r:
+                    rmp.b_k_r[r, k] = sum(rmp.q_rs[r, s] for s in rmp.S if s != r)
+                else:
+                    rmp.b_k_r[r, k] = -rmp.q_rs[r, k]
 
         ## capacity under parking reduction factor
-        def init_c_1(model, i, j):
-            return model.c_0[i, j] * model.f_l[i, j] * model.f_p[i, j]
-
-        model.c_1 = pyo.Param(model.A, within=pyo.NonNegativeReals, initialize=init_c_1)
+        rmp.c_1 = {}
+        for i, j in rmp.A:
+            rmp.c_1[i, j] = rmp.c_0[i, j] * rmp.f_l[i, j] * rmp.f_p[i, j]
 
         # 2.7 Objective weight parameters
-        model.w_1 = self.w_1
-        model.w_2 = self.w_2
-        model.w_3 = self.w_3
+        rmp.w_1 = self.w_1
+        rmp.w_2 = self.w_2
+        rmp.w_3 = self.w_3
 
         # 3. Variables
         ## 3.1 Parking policy Decision variable, shape: |A|
-        model.y_ij = pyo.Var(model.A, domain=pyo.Binary)
+        rmp.y_ij = model.addVars(rmp.A, vtype=GRB.BINARY, name="y_ij")
 
         ## 3.2 Link flow variable x_ij, shape: |A|
-        def x_ij_0_bounds(model, i, j):
-            return (0, 2 * model.c_0[i, j])
+        rmp.x_ij_0 = model.addVars(rmp.A, lb=0.0, name="x_ij_0")
+        rmp.x_ij_1 = model.addVars(rmp.A, lb=0.0, name="x_ij_1")
 
-        def x_ij_1_bounds(model, i, j):
-            return (0, 2 * model.c_1[i, j])
+        # Setting bounds
+        for i, j in rmp.A:
+            rmp.x_ij_0[i, j].UB = 2 * rmp.c_0[i, j]
+            rmp.x_ij_1[i, j].UB = 2 * rmp.c_1[i, j]
 
-        model.x_ij_0 = pyo.Var(
-            model.A, domain=pyo.NonNegativeReals, bounds=x_ij_0_bounds
-        )
-        model.x_ij_1 = pyo.Var(
-            model.A, domain=pyo.NonNegativeReals, bounds=x_ij_1_bounds
-        )
-
-        def init_x_ij(model, i, j):
-            return model.x_ij_0[i, j] + model.x_ij_1[i, j]
-
-        model.x_ij = pyo.Expression(model.A, rule=init_x_ij)
+        # Simulating Expression x_ij
+        rmp.x_ij = {k: rmp.x_ij_0[k] + rmp.x_ij_1[k] for k in rmp.A}
 
         # Fix parking policy == allow, for links with lane_separator
-        for i, j in model.A:
-            if model._delta[i, j] == 0:
-                model.y_ij[i, j].fix(1)
+        for i, j in rmp.A:
+            if rmp._delta[i, j] == 0:
+                rmp.y_ij[i, j].lb = 1
+                rmp.y_ij[i, j].ub = 1
 
         ## 3.3 u_ij and z_ij for linearizing |L_ij - N_ij * y_ij|
-        model.u_ij = pyo.Var(model.A, domain=pyo.NonNegativeReals)
-        model.z_ij = pyo.Var(model.A, domain=pyo.NonNegativeReals)
+        rmp.u_ij = model.addVars(rmp.A, lb=0.0, name="u_ij")
+        rmp.z_ij = model.addVars(rmp.A, lb=0.0, name="z_ij")
 
         ## 3.4 path-flow variables x_ij_r, shape: |A|*|R|*|S|
-        model.x_ij_r = pyo.Var(model.A, model.R, domain=pyo.NonNegativeReals)
+        rmp.x_ij_r = model.addVars(rmp.A, rmp.R, lb=0.0, name="x_ij_r")
 
         # 4. Constraints
         ## 4.1 u_ij and z_ij constraints
-        def unsatisfied_parking_demand_rule(model, i, j):
-            return (
-                model.u_ij[i, j]
-                >= model.L_ij[i, j] - model.N_ij[i, j] * model.y_ij[i, j]
-            )
-
-        model.u_ij_constr = pyo.Constraint(
-            model.A, rule=unsatisfied_parking_demand_rule
+        model.addConstrs(
+            (rmp.u_ij[i, j] >= rmp.L_ij[i, j] - rmp.N_ij[i, j] * rmp.y_ij[i, j] for i, j in rmp.A),
+            name="unsatisfied_parking_demand_rule"
         )
 
-        def unused_parking_lots_rule(model, i, j):
-            return (
-                model.z_ij[i, j]
-                >= model.N_ij[i, j] * model.y_ij[i, j] - model.L_ij[i, j]
-            )
-
-        model.z_ij_constr = pyo.Constraint(model.A, rule=unused_parking_lots_rule)
+        model.addConstrs(
+            (rmp.z_ij[i, j] >= rmp.N_ij[i, j] * rmp.y_ij[i, j] - rmp.L_ij[i, j] for i, j in rmp.A),
+            name="unused_parking_lots_rule"
+        )
 
         ## 4.2 Constraints link x_ij and x_ij_0, x_ij_1
-        @model.Constraint(model.A)
-        def x_ij_0_rule(model, i, j):
-            return model.x_ij_0[i, j] <= model.big_M[i, j] * (1 - model.y_ij[i, j])
+        model.addConstrs(
+            (rmp.x_ij_0[i, j] <= rmp.big_M[i, j] * (1 - rmp.y_ij[i, j]) for i, j in rmp.A),
+            name="x_ij_0_rule"
+        )
 
-        @model.Constraint(model.A)
-        def x_ij_1_rule(model, i, j):
-            return model.x_ij_1[i, j] <= model.big_M[i, j] * model.y_ij[i, j]
+        model.addConstrs(
+            (rmp.x_ij_1[i, j] <= rmp.big_M[i, j] * rmp.y_ij[i, j] for i, j in rmp.A),
+            name="x_ij_1_rule"
+        )
 
         ## 4.3 Node flow conservation constraints
-        @model.Constraint(model.R, model.S)
-        def node_flow_conservation_rule(model, r, k):
-            inflow = sum(model.x_ij_r[i, j, r] for (i, j) in model.A if j == k)
-            outflow = sum(model.x_ij_r[i, j, r] for (i, j) in model.A if i == k)
-            return outflow - inflow == model.b_k_r[r, k]
+        model.addConstrs(
+            (gp.quicksum(rmp.x_ij_r[i, j, r] for (i, j) in rmp.A if i == k) -
+             gp.quicksum(rmp.x_ij_r[i, j, r] for (i, j) in rmp.A if j == k) == rmp.b_k_r[r, k]
+             for r in rmp.R for k in rmp.S),
+            name="node_flow_conservation_rule"
+        )
 
-        @model.Constraint(model.A)
-        def x_ij_r_flow_aggregation_rule(model, i, j):
-            return (
-                sum(model.x_ij_r[i, j, r] for r in model.R)
-                == model.x_ij_0[i, j] + model.x_ij_1[i, j]
-            )
+        model.addConstrs(
+            (gp.quicksum(rmp.x_ij_r[i, j, r] for r in rmp.R) == rmp.x_ij_0[i, j] + rmp.x_ij_1[i, j]
+             for i, j in rmp.A),
+            name="x_ij_r_flow_aggregation_rule"
+        )
 
         return model
 
@@ -460,48 +368,45 @@ class OA(DNDP):
         # reset link flow to zero before each UE-TAP
         self.network.link_time_cost = self.network.link_fft
 
-        TSTT = self.solve_UE_TAP(epsilon, maxIter)
+        ue_cost = self.solve_UE_TAP(epsilon, maxIter)
         logging.info(f"Non-linear Subproblem solved")
-        return
+        return ue_cost
 
     def add_no_good_cut(self):
+        # Change: accessing vars from self.RMP
         model = self.RMP.model
-        B_k, N_k = set(), set()
+        rmp = self.RMP
+        B_k, N_k = [], []
 
-        for i, j in model.A:
-            if pyo.value(model.y_ij[i, j]) > 0.5:
-                B_k.add((i, j))
+        for i, j in rmp.A:
+            if rmp.y_ij[i, j].X > 0.5:
+                B_k.append((i, j))
             else:
-                N_k.add((i, j))
-        # self.minlp.model.integer_cut = pyo.Constraint(
-        model.no_good_cuts.add(
-            expr=sum(model.y_ij[i, j] for (i, j) in model.A if (i, j) in B_k)
-            - sum(model.y_ij[i, j] for (i, j) in model.A if (i, j) in N_k)
+                N_k.append((i, j))
+
+        model.addConstr(
+            gp.quicksum(rmp.y_ij[i, j] for (i, j) in B_k)
+            - gp.quicksum(rmp.y_ij[i, j] for (i, j) in N_k)
             <= len(B_k) - 1
         )
-        logging.info(f"Add no-good cut: sum(y in B_k) - sum(y in N_k) <= {len(B_k)-1}")
+        logging.info(f"Add no-good cut: sum(y in B_k) - sum(y in N_k) <= {len(B_k) - 1}")
 
     def add_UE_reduction_cut(self):
+
         model = self.RMP.model
-        rhs = sum(
-            (1 - model.y_ij[i, j])
-            * model.fft[i, j]
-            * (
-                self.network.link_flow[idx]
-                + 0.03 * self.network.link_flow[idx] ** 5 / model.c_0[i, j] ** 4
-            )
-            for idx, (i, j) in enumerate(self.network.links_id)
-        ) + sum(
-            model.y_ij[i, j]
-            * model.fft[i, j]
-            * (
-                self.network.link_flow[idx]
-                + 0.03 * self.network.link_flow[idx] ** 5 / model.c_1[i, j] ** 4
-            )
-            for idx, (i, j) in enumerate(self.network.links_id)
-        )
-        model.ue_reduction_cuts.add(
-            expr=sum(model._kappa[i, j] for i, j in model.A) <= rhs
+        rmp = self.RMP
+
+        rhs_val = 0
+        for idx, (i, j) in enumerate(self.network.links_id):
+            # Recalculate expression for RHS since we don't use Pyomo expressions
+            flow = self.network.link_flow[idx]
+            term_0 = rmp.fft[i, j] * (flow + 0.03 * flow ** 5 / rmp.c_0[i, j] ** 4)
+            term_1 = rmp.fft[i, j] * (flow + 0.03 * flow ** 5 / rmp.c_1[i, j] ** 4)
+            rhs_val += (1 - rmp.y_ij[i,j]) * term_0 + rmp.y_ij[i,j] * term_1
+
+        model.addConstr(
+            gp.quicksum(rmp._kappa[i, j] for i, j in rmp.A) <= rhs_val,
+            name=f"ue_reduction_cut_{len(model.getConstrs())}"
         )
         logging.info(
             f"Add UE-reduction cut: sum(kappa_ij) <= sum of current UE-TAP objective value"
@@ -512,27 +417,30 @@ class RMIL_MP:
     """
     Relaxed Master Integer Linear Programming (RMIL_MP) problem for solving the DNDP using Outer Approximation algorithm.
     """
+
     def __init__(self):
         self.model = None
-        self.epsilon = 5e-3
+        self.epsilon = 1e-4
         self.true_obj_cost = float("inf")
         self.linear_obj_cost = -float("inf")
         self.true_ue_cost = float("inf")
         self.linear_ue_cost = -float("inf")
         self.obj_gap = float("inf")
         self.ue_gap = float("inf")
-        self.solver = SolverFactory("gurobi")
-        self.solver.options = {
-            "MIPGap": self.epsilon,
-            "FeasibilityTol": 1e-6,
-        }
+        # Change: Solver factory removed, Gurobi model handles itself
 
     def solve_RMIL_MP(self):
         self.obj_gap = float("inf")
         self.ue_gap = float("inf")
         i = 1
+
+        # Change: Set params on the model object
+        self.model.Params.MIPGap = self.epsilon
+        self.model.Params.FeasibilityTol = 1e-6
+
         while self.obj_gap >= self.epsilon or self.ue_gap >= self.epsilon:
-            logging.info(f"--------------Relaxed Mixed Integer Linear Programming Master Problem iteration {i} starts--------------")
+            logging.info(
+                f"--------------Relaxed Mixed Integer Linear Programming Master Problem iteration {i} starts--------------")
             # 2. solve the MILP, w.r.t  y_ij, x_ij_0, x_ij_1
             self.add_milp_cut()
             self.solve_milp()
@@ -553,177 +461,189 @@ class RMIL_MP:
         model = self.model
 
         # 0. Initialize x_0_k and x_1_k, the linearization point
-        model.x_0_k = pyo.Param(
-            model.A, within=pyo.NonNegativeReals, initialize=0, mutable=True
-        )
-        model.x_1_k = pyo.Param(
-            model.A, within=pyo.NonNegativeReals, initialize=0, mutable=True
-        )
+        # Change: Python dicts used instead of Pyomo Param(mutable=True)
+        self.x_0_k = {k: 0.0 for k in self.A}
+        self.x_1_k = {k: 0.0 for k in self.A}
 
         # 1. Add auxilary varibles for linearizing objective
         # zeta: objective variable in the MILP master problem
-        model._zeta = pyo.Var(model.A, domain=pyo.NonNegativeReals)
+        self._zeta = model.addVars(self.A, lb=0.0, name="zeta")
         # eta: variable for linearizing UE-reduction cut
-        model._kappa = pyo.Var(model.A, domain=pyo.NonNegativeReals, initialize=0.0)
+        self._kappa = model.addVars(self.A, lb=0.0, name="kappa")
 
         # zeta >= free flow system optimal cost + u_ij + z_ij
-        @model.Constraint(model.A)
-        def zeta_minimum_rule(model, i, j):
-            return model._zeta[i, j] >= model.fft[i, j] * (
-                model.x_ij_0[i, j] + model.x_ij_1[i, j]
-            )
+        model.addConstrs(
+            (self._zeta[i, j] >= self.fft[i, j] * (self.x_ij_0[i, j] + self.x_ij_1[i, j])
+             for i, j in self.A),
+            name="zeta_minimum_rule"
+        )
 
         # 2. Add first-order taylor approximation constraints of SO cost
-        def x_ij_0_gradient(model, i, j):
-            return model.fft[i, j] * (
-                1 + 0.75 / model.c_0[i, j] ** 4 * model.x_0_k[i, j] ** 4
+        # Change: Using simple Python functions/dicts
+        def x_ij_0_gradient(i, j):
+            return self.fft[i, j] * (
+                    1 + 0.75 / self.c_0[i, j] ** 4 * self.x_0_k[i, j] ** 4
             )
 
-        def x_ij_1_gradient(model, i, j):
-            return model.fft[i, j] * (
-                1 + 0.75 / (model.c_1[i, j]) ** 4 * model.x_1_k[i, j] ** 4
+        def x_ij_1_gradient(i, j):
+            return self.fft[i, j] * (
+                    1 + 0.75 / (self.c_1[i, j]) ** 4 * self.x_1_k[i, j] ** 4
             )
 
-        model.grad_0 = pyo.Param(model.A, initialize=x_ij_0_gradient, mutable=True)
-        model.grad_1 = pyo.Param(model.A, initialize=x_ij_1_gradient, mutable=True)
+        self.grad_0 = {k: x_ij_0_gradient(*k) for k in self.A}
+        self.grad_1 = {k: x_ij_1_gradient(*k) for k in self.A}
 
         # 3. Set milp objective
-        @model.Objective(sense=pyo.minimize)
-        def objective(model):
-            return sum(
-                model.w_1 * model.u_ij[i, j]
-                + model.w_2 * model.z_ij[i, j]
-                + model.w_3 * model._zeta[i, j]
-                for i, j in model.A
-            )
+        # Change: Gurobi setObjective
+        obj_expr = gp.quicksum(
+            self.w_1 * self.u_ij[i, j]
+            + self.w_2 * self.z_ij[i, j]
+            + self.w_3 * self._zeta[i, j]
+            for i, j in self.A
+        )
+        model.setObjective(obj_expr, GRB.MINIMIZE)
 
-        model.milp_cuts = pyo.ConstraintList()
-        model.ue_reduction_cuts = pyo.ConstraintList()
-        model.no_good_cuts = pyo.ConstraintList()
         # Initialize ue_reduction cuts:
-        for i, j in model.A:
-            model.ue_reduction_cuts.add(
-                expr=model._kappa[i, j]
-                >= model.fft[i, j] * (model.x_ij_0[i, j] + model.x_ij_1[i, j])
+        for i, j in self.A:
+            model.addConstr(
+                self._kappa[i, j] >= self.fft[i, j] * (self.x_ij_0[i, j] + self.x_ij_1[i, j])
             )
 
-        model.x_obj_threshold = pyo.Param(model.A, initialize=0, mutable=True)
-        model.x_ue_threshold = pyo.Param(model.A, initialize=0, mutable=True)
+        self.x_obj_threshold = {k: 0.0 for k in self.A}
+        self.x_ue_threshold = {k: 0.0 for k in self.A}
 
     def solve_milp(self):
         model = self.model
-        self.result = self.solver.solve(model, tee=False)
-        if (
-            self.result.solver.status == SolverStatus.ok
-            and self.result.solver.termination_condition == TerminationCondition.optimal
-        ):
-            for i, j in model.A:
-                model.x_0_k[i, j].value = max(0, model.x_ij_0[i, j].value)
-                model.x_1_k[i, j].value = max(0, model.x_ij_1[i, j].value)
-                model.grad_0[i, j].value = model.fft[i, j] * (
-                    1 + 0.75 / model.c_0[i, j] ** 4 * model.x_0_k[i, j].value ** 4
+        model.optimize()
+
+        if model.Status == GRB.OPTIMAL:
+            for i, j in self.A:
+                self.x_0_k[i, j] = max(0, self.x_ij_0[i, j].X)
+                self.x_1_k[i, j] = max(0, self.x_ij_1[i, j].X)
+                self.grad_0[i, j] = self.fft[i, j] * (
+                        1 + 0.75 / self.c_0[i, j] ** 4 * self.x_0_k[i, j] ** 4
                 )
-                model.grad_1[i, j].value = model.fft[i, j] * (
-                    1 + 0.75 / (model.c_1[i, j]) ** 4 * model.x_1_k[i, j].value ** 4
+                # Gradient for x_ij_1 (Capacity C_1)
+                self.grad_1[i, j] = self.fft[i, j] * (
+                        1 + 0.75 / self.c_1[i, j] ** 4 * self.x_1_k[i, j] ** 4
                 )
-                model.capacity[i, j].value = model.c_0[i, j] * (
-                    1 - round(model.y_ij[i, j].value)
-                ) + model.c_1[i, j] * round(model.y_ij[i, j].value)
+
+                y_val = round(self.y_ij[i, j].X)
+                self.capacity[i, j] = self.c_0[i, j] * (
+                        1 - y_val
+                ) + self.c_1[i, j] * y_val
         else:
-            logging.info(self.result.solver.termination_condition)
+            logging.info(f"Solver Status: {model.Status}")
 
         return
 
     def add_milp_cut(self):
         model = self.model
-        for i, j in model.A:
+        for i, j in self.A:
             # 1. Linearize the SO cost(objective function) at (x_0_k, x_1_k)
-            x0k = pyo.value(model.x_0_k[i, j])
-            x1k = pyo.value(model.x_1_k[i, j])
+            x0k = self.x_0_k[i, j]
+            x1k = self.x_1_k[i, j]
             if (
-                x0k + x1k > model.x_obj_threshold[i, j].value
-                and self.obj_gap > self.epsilon
+                    x0k + x1k > self.x_obj_threshold[i, j]
+                    and self.obj_gap > self.epsilon
             ):
-                grad_0 = pyo.value(model.grad_0[i, j])
-                grad_1 = pyo.value(model.grad_1[i, j])
+                grad_0 = self.grad_0[i, j]
+                grad_1 = self.grad_1[i, j]
                 rhs = (
-                    x0k
-                    * model.fft[i, j]
-                    * (1 + model._alpha * (x0k / model.c_0[i, j]) ** model._beta)
-                    + x1k
-                    * model.fft[i, j]
-                    * (1 + model._alpha * (x1k / model.c_1[i, j]) ** model._beta)
-                    + grad_0 * (model.x_ij_0[i, j] - x0k)
-                    + grad_1 * (model.x_ij_1[i, j] - x1k)
+                        x0k
+                        * self.fft[i, j]
+                        * (1 + self._alpha * (x0k / self.c_0[i, j]) ** self._beta)
+                        + x1k
+                        * self.fft[i, j]
+                        * (1 + self._alpha * (x1k / self.c_1[i, j]) ** self._beta)
+                        + grad_0 * (self.x_ij_0[i, j] - x0k)
+                        + grad_1 * (self.x_ij_1[i, j] - x1k)
                 )
-                self.model.milp_cuts.add(expr=model._zeta[i, j] >= rhs)
+                model.addConstr(self._zeta[i, j] >= rhs)
 
             # 2. Linearize the UE-reduction cut at (x_0_k, x_1_k)
             if (
-                x0k + x1k > model.x_ue_threshold[i, j].value
-                and self.ue_gap > self.epsilon
+                    x0k + x1k > self.x_ue_threshold[i, j]
+                    and self.ue_gap > self.epsilon
             ):
                 rhs_ue_cut = (
-                    model.fft[i, j] * (x0k + 0.03 * x0k**5 / model.c_0[i, j] ** 4)
-                    + model.fft[i, j]
-                    * (1 + model._alpha * (x0k / model.c_0[i, j]) ** model._beta)
-                    * (model.x_ij_0[i, j] - x0k)
-                    + model.fft[i, j] * (x1k + 0.03 * x1k**5 / model.c_1[i, j] ** 4)
-                    + model.fft[i, j]
-                    * (1 + model._alpha * (x1k / model.c_1[i, j]) ** model._beta)
-                    * (model.x_ij_1[i, j] - x1k)
+                        self.fft[i, j] * (x0k + 0.03 * x0k ** 5 / self.c_0[i, j] ** 4)
+                        + self.fft[i, j]
+                        * (1 + self._alpha * (x0k / self.c_0[i, j]) ** self._beta)
+                        * (self.x_ij_0[i, j] - x0k)
+                        + self.fft[i, j] * (x1k + 0.03 * x1k ** 5 / self.c_1[i, j] ** 4)
+                        + self.fft[i, j]
+                        * (1 + self._alpha * (x1k / self.c_1[i, j]) ** self._beta)
+                        * (self.x_ij_1[i, j] - x1k)
                 )
-                model.ue_reduction_cuts.add(expr=model._kappa[i, j] >= rhs_ue_cut)
+                model.addConstr(self._kappa[i, j] >= rhs_ue_cut)
+
+    def update_linearization_point(self, link_flows, y_fixed):
+        """
+        Updates x_0_k and x_1_k using the true feasible flows from the UE Subproblem.
+        Crucial for correct Outer Approximation cuts.
+        """
+        for idx, (i, j) in enumerate(self.A):
+            true_flow = link_flows[idx]
+
+            # Use the y from the solution we just evaluated
+            # (If y[i,j] is 1, flow belongs to x_1, else x_0)
+            if y_fixed[i, j] > 0.5:
+                self.x_0_k[i, j] = 0.0
+                self.x_1_k[i, j] = true_flow
+            else:
+                self.x_0_k[i, j] = true_flow
+                self.x_1_k[i, j] = 0.0
+
+            # Update gradients immediately for the next cut generation
+            self.grad_0[i, j] = self.fft[i, j] * (
+                    1 + 0.75 / self.c_0[i, j] ** 4 * self.x_0_k[i, j] ** 4
+            )
+            self.grad_1[i, j] = self.fft[i, j] * (
+                    1 + 0.75 / (self.c_1[i, j]) ** 4 * self.x_1_k[i, j] ** 4
+            )
 
     def update_gap(self):
         model = self.model
         # 1. Update the gap between true objective and linearized objective
         self.true_obj_cost = sum(
-            model.x_ij[i, j]()
-            * model.fft[i, j]
+            (self.x_ij_0[i, j].X + self.x_ij_1[i, j].X)
+            * self.fft[i, j]
             * (
-                1
-                + model._alpha
-                * (model.x_ij[i, j]() / model.capacity[i, j].value) ** model._beta
+                    1
+                    + self._alpha
+                    * ((self.x_ij_0[i, j].X + self.x_ij_1[i, j].X) / self.capacity[i, j]) ** self._beta
             )
-            for i, j in model.A
+            for i, j in self.A
         )
-        # self.true_obj_cost = sum(
-        #     model.x_ij_0[i, j].value
-        #     * model.fft[i, j]
-        #     * (
-        #         1
-        #         + model._alpha
-        #         * (model.x_ij_0[i, j].value / model.c_0[i, j]) ** model._beta
-        #     )
-        #     + model.x_ij_1[i, j].value
-        #     * model.fft[i, j]
-        #     * (
-        #         1
-        #         + model._alpha
-        #         * (model.x_ij_1[i, j].value / model.c_1[i, j]) ** model._beta
-        #     )
-        #     for i, j in model.A
-        # )
 
-        self.linear_obj_cost = pyo.value(sum(model._zeta[i, j] for i, j in model.A))
-        self.obj_gap = (self.true_obj_cost - self.linear_obj_cost) / self.true_obj_cost
+        self.linear_obj_cost = sum(self._zeta[i, j].X for i, j in self.A)
+        # Avoid division by zero
+        if self.true_obj_cost != 0:
+            self.obj_gap = (self.true_obj_cost - self.linear_obj_cost) / self.true_obj_cost
+        else:
+            self.obj_gap = 0
+
         logging.info(
             "Linearizing SO cost: Current gap: {}, Current true cost: {}, linear cost: {}, ".format(
-                round(self.obj_gap,5), self.true_obj_cost, self.linear_obj_cost
+                round(self.obj_gap, 5), self.true_obj_cost, self.linear_obj_cost
             )
         )
         # 2. Update the gap between true UE cost and linearized UE cost
         self.true_ue_cost = sum(
-            model.fft[i, j]
+            self.fft[i, j]
             * (
-                model.x_ij[i, j]()
-                + 0.03 * model.x_ij[i, j]() ** 5 / model.capacity[i, j].value ** 4
+                    (self.x_ij_0[i, j].X + self.x_ij_1[i, j].X)
+                    + 0.03 * (self.x_ij_0[i, j].X + self.x_ij_1[i, j].X) ** 5 / self.capacity[i, j] ** 4
             )
-            for i, j in model.A
+            for i, j in self.A
         )
-        self.linear_ue_cost = sum(model._kappa[i, j].value for i, j in model.A)
-        self.ue_gap = (self.true_ue_cost - self.linear_ue_cost) / self.true_ue_cost
+        self.linear_ue_cost = sum(self._kappa[i, j].X for i, j in self.A)
+
+        if self.true_ue_cost != 0:
+            self.ue_gap = (self.true_ue_cost - self.linear_ue_cost) / self.true_ue_cost
+        else:
+            self.ue_gap = 0
 
         logging.info(
             "Linearizing UE-reduction constraint: Current gap: {}, true cost: {}, linear cost: {}".format(
@@ -738,41 +658,44 @@ class RMIL_MP:
         return x_threshold
         """
         model = self.model
-        so_cost_threshold = pyo.value(model.objective) * self.epsilon / 2 / len(model.A)
+
+        so_cost_threshold = model.ObjVal * self.epsilon / 2 / len(self.A)
         ue_cost_threshold = (
-            sum(model._kappa[i, j].value for i, j in model.A)
-            * self.epsilon
-            / 2
-            / len(model.A)
+                sum(self._kappa[i, j].X for i, j in self.A)
+                * self.epsilon
+                / 2
+                / len(self.A)
         )
 
         def solve_equation(i, j):
+            # Change: accessing capacity from dict
+            c_val = self.capacity[i, j]
+
             def SO_cost(x):
                 return (
-                    x
-                    * model.fft[i, j]
-                    * (
-                        1
-                        + model._alpha * (x / model.capacity[i, j].value) ** model._beta
-                    )
-                    - so_cost_threshold
+                        x
+                        * self.fft[i, j]
+                        * (
+                                1
+                                + self._alpha * (x / c_val) ** self._beta
+                        )
+                        - so_cost_threshold
                 )
 
             def UE_cost(x):
                 return (
-                    model.fft[i, j]
-                    * (x + 0.03 * x**5 / model.capacity[i, j].value ** 4)
-                    - ue_cost_threshold
+                        self.fft[i, j]
+                        * (x + 0.03 * x ** 5 / c_val ** 4)
+                        - ue_cost_threshold
                 )
 
             x_obj_threshold = opt.fsolve(SO_cost, 1)[0]
             x_ue_threshold = opt.fsolve(UE_cost, 1)[0]
             return x_obj_threshold, x_ue_threshold
 
-        for i, j in model.A:
-            model.x_obj_threshold[i, j].value, model.x_ue_threshold[i, j].value = (
+        for i, j in self.A:
+            self.x_obj_threshold[i, j], self.x_ue_threshold[i, j] = (
                 solve_equation(i, j)
             )
 
         return
-

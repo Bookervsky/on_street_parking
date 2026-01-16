@@ -21,7 +21,7 @@ class DNDP:
         self.network = None
 
         self.w_1 = 100  # weight for u_ij in objective
-        self.w_2 = 1  # weight for z_ij in objective
+        self.w_2 = 1 # weight for z_ij in objective
         self.w_3 = 1  # weight for SO cost in objective
         self.LB_record = []
         self.UB_record = []
@@ -187,11 +187,16 @@ class DNDP:
         alpha = self.network.link_b
         beta = self.network.link_power
 
+        if self.network.link_flow is None:
+            self.network.link_flow = np.zeros(len(self.links))
+
+        self.network.link_time_cost = self.network.link_fft * (
+                1
+                + alpha * (self.network.link_flow / self.network.link_capacity) ** beta
+        )
+
         while gap >= epsilon:
-            if self.network.link_flow is None:
-                self.network.link_flow = np.zeros(len(self.links))
-            else:
-                pass
+
 
             # 2. Calculate CURRENT TSTT (before finding new direction)
             TSTT = np.sum(
